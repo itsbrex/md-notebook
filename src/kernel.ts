@@ -1,5 +1,5 @@
 /* eslint-disable @typescript-eslint/naming-convention */
-import { NotebookDocument, NotebookCell, NotebookController, NotebookCellOutput, NotebookCellOutputItem, NotebookRange, NotebookEdit, WorkspaceEdit, workspace } from 'vscode';
+import { NotebookDocument, NotebookCell, NotebookController, NotebookCellOutput, NotebookCellOutputItem, NotebookRange, NotebookEdit, WorkspaceEdit, workspace, window } from 'vscode';
 import { processCellsRust } from "./languages/rust";
 import { fixImportsGo, processCellsGo } from "./languages/go";
 import { processCellsJavascript } from "./languages/javascript";
@@ -8,9 +8,10 @@ import { ChildProcessWithoutNullStreams, spawnSync } from 'child_process';
 import { processShell as processShell } from './languages/shell';
 import fetch from 'node-fetch';
 import { processCellsPython } from './languages/python';
-const { promisify } = require('util');
-const sleep = promisify(setTimeout);
 import * as vscode from 'vscode';
+import { processCellsMojo } from './languages/mojo';
+import { getOpenAIKey, getOpenAIModel, getOpenAIOrgID } from "./config"
+import { execSync } from 'child_process';
 
 
 export interface Cell {
@@ -50,6 +51,42 @@ interface ChatMessage {
 
 export let lastRunLanguage = '';
 
+
+function commandNotOnPath(command: string, link: string): boolean {
+  try {
+    // Use the "where" command on Windows or the "which" command on macOS/Linux
+    const cmd = process.platform === 'win32' ? 'where' : 'which';
+    execSync(`${cmd} ${command}`, { stdio: 'ignore' });
+    return false;
+  } catch (error) {
+    vscode.window.showErrorMessage(`${command} not on path`, ...[`Install ${command}`]).then((_)=>{
+        vscode.env.openExternal(vscode.Uri.parse(link));
+    });
+    return true;
+  }
+}
+
+
+let post = async (url, headers, body): Promise<ChatResponse> => {
+    try {
+        let response = await fetch(url, { headers, body, method: 'POST' });
+
+        // Check if status code starts with 2
+        if (response.status >= 300) {
+            window.showErrorMessage(`Error getting response: ${response.status}\n${await response.text()}`);
+            return {} as ChatResponse;
+        }
+
+        let json = await response.json()
+        window.showInformationMessage(`Response from openai: ${JSON.stringify(json, null, 2)}`);
+        return json as ChatResponse;
+        // Proceed with the `result` if needed
+    } catch (error) {
+        window.showErrorMessage("Error with fetch request:" + error.toString());
+        return {} as ChatResponse;
+    }
+}
+
 export class Kernel {
     // Use the same code for Run All, just takes the last cell
     async executeCells(doc: NotebookDocument, cells: NotebookCell[], ctrl: NotebookController): Promise<void> {
@@ -87,41 +124,47 @@ export class Kernel {
 
         const lang = cells[0].document.languageId;
 
-        if (lang === "chatgpt") {
-            lastRunLanguage = "chatgpt";
+        if (lang === "openai") {
+            lastRunLanguage = "openai";
             const url = 'https://api.openai.com/v1/chat/completions';
             const headers = {
                 'Content-Type': 'application/json',
-                'Authorization': 'Bearer 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',
-                'OpenAI-Organization': 'org-w6zOoRsL3BhbJOc8Yi3GLozs',
+                'Authorization': `Bearer ${getOpenAIKey()}`,
             };
-            const messages: ChatMessage[] = [{ role: "system", content: "You are ChatGPT, an assistant helping to write code" }];
+            let orgId = getOpenAIOrgID()
+            let model = getOpenAIModel() || "oh no what wrong"
+            if (orgId) {
+                headers['OpenAI-Organization'] = orgId
+            }
+            const messages: ChatMessage[] = [{ role: "system", content: "You are a helpful bot named mdl, that generates concise code blocks to solve programming problems" }];
             for (const message of cellsStripped) {
                 messages.push({ role: "user", content: message.contents });
             }
             const data: ChatRequest = {
-                model: 'gpt-3.5-turbo',
+                model,
                 messages
             };
 
             let body = JSON.stringify(data);
 
 
-            let result: ChatResponse = await fetch(url, { headers, body, method: 'POST' })
-                .then((response) => response.json())
-                .then((data) => data)
-                .catch((error) => console.error(error)) as ChatResponse;
+            let result = await post(url, headers, body)
+            if (!result) {
+                exec.end(false, (new Date).getTime());
+                return
+            }
 
             let text = result.choices[0].message.content;
             let code_blocks = text.split("```");
-            let language = "";
+
             let edits: vscode.NotebookCellData[] = [];
-            for (let block of code_blocks) {
-                if (block.startsWith("python")) {
-                    language = "python";
-                    block = block.substring(6);
+            for (let [i, block] of code_blocks.entries()) {
+                // If there was any text after split, get the type of language
+                if (block[0] != "\n" && i != 0) {
+                    let language = block.split("\n")[0]
+                    block = block.substring(language.length);
                     let blockTrimmed = block.trim().replace("\n\n", "");
-                    edits.push(new vscode.NotebookCellData(vscode.NotebookCellKind.Code, blockTrimmed, "python"));
+                    edits.push(new vscode.NotebookCellData(vscode.NotebookCellKind.Code, blockTrimmed, language));
                 }
                 else {
                     let blockTrimmed = block.trim().replace("\n\n", "");
@@ -136,21 +179,45 @@ export class Kernel {
             exec.end(true, (new Date).getTime());
         } else {
             let output: ChildProcessWithoutNullStreams;
-            const mimeType = `jackos.mdl/chatgpt`;
+            const mimeType = `text/plain`;
             switch (lang) {
+                case "mojo":
+                    if (commandNotOnPath('mojo', "https://modular.com/mojo")) {
+                        exec.end(false, (new Date).getTime());
+                        return
+                    }
+                    lastRunLanguage = "mojo";
+                    output = processCellsMojo(cellsStripped);
+                    break;
                 case "rust":
+                    if (commandNotOnPath('cargo', "https://rustup.rs")) {
+                        exec.end(false, (new Date).getTime());
+                        return
+                    }
                     lastRunLanguage = "rust";
                     output = processCellsRust(cellsStripped);
                     break;
                 case "go":
+                    if (commandNotOnPath("go", "https://go.dev/doc/install")) {
+                        exec.end(false, (new Date).getTime());
+                        return
+                    }
                     lastRunLanguage = "go";
                     output = processCellsGo(cellsStripped);
                     break;
                 case "python":
-                    lastRunLanguage = "go";
+                    if (commandNotOnPath("python", "https://www.python.org/downloads/")) {
+                        exec.end(false, (new Date).getTime());
+                        return
+                    }
+                    lastRunLanguage = "python";
                     output = processCellsPython(cellsStripped);
                     break;
                 case "javascript":
+                    if (commandNotOnPath("node", "https://nodejs.org/en/download/package-manager")) {
+                        exec.end(false, (new Date).getTime());
+                        return
+                    }
                     lastRunLanguage = "javascript";
                     output = processCellsJavascript(cellsStripped);
                     break;
@@ -158,7 +225,7 @@ export class Kernel {
                     let esr = spawnSync("esr");
                     if (esr.stdout === null) {
                         let response = encoder.encode("To make TypeScript run fast install esr globally:\nnpm install -g esbuild-runner");
-                        const x = new NotebookCellOutputItem(response, "jackos.mdl/chatgpt");
+                        const x = new NotebookCellOutputItem(response, mimeType);
                         exec.appendOutput([new NotebookCellOutput([x])], cells[0]);
                         exec.end(false, (new Date).getTime());
                         return;
@@ -184,7 +251,7 @@ export class Kernel {
                     break;
                 default:
                     let response = encoder.encode("Language hasn't been implemented yet");
-                    const x = new NotebookCellOutputItem(response, "jackos.mdl/chatgpt");
+                    const x = new NotebookCellOutputItem(response, mimeType);
                     exec.appendOutput([new NotebookCellOutput([x])], cells[0]);
                     exec.end(false, (new Date).getTime());
                     return;

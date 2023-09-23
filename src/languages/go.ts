@@ -83,7 +83,7 @@ export let processCellsGo = (cells: Cell[]): ChildProcessWithoutNullStreams => {
     };
     let main = "package main\n" + imports + outerScope + "func main() {\nlog.SetOutput(os.Stdout)\n" + innerScope + "}";
     // let dir = path.join(spawnSync('go', ['env', 'GOPATH']).stdout.toString().trim(), "src", "github.com", "mdl", "temp");
-    let dir = path.join(getTempPath(), 'go');
+    let dir = getTempPath();
     let mainFile = path.join(dir, 'main.go');
     mkdirSync(dir, { recursive: true });
     writeFileSync(mainFile, main);
@@ -96,24 +96,24 @@ export let fixImportsGo = (exec: NotebookCellExecution, cell: NotebookCell): Pro
         let encoder = new TextEncoder();
         console.log("tidying");
         let tempDir = getTempPath();
-        let goMod = "module github.com/mdl/temp\ngo 1.17\n";
-        let goModFile = path.join(tempDir, 'go', 'go.mod');
+        let goMod = "module github.com/mdl/temp\ngo 1.21\n";
+        let goModFile = path.join(tempDir, 'go.mod');
         writeFileSync(goModFile, goMod);
-        let tidy = spawn('go', ['mod', 'tidy'], { cwd: path.join(tempDir, "go") });
+        let tidy = spawn('go', ['mod', 'tidy'], { cwd: tempDir });
         tidy.stderr.on("data", (tidyData: Uint8Array) => {
             console.log("data", tidyData);
-            const x = new NotebookCellOutputItem(tidyData, "jackos.mdl/chatgpt");
+            const x = new NotebookCellOutputItem(tidyData, "text/plain");
             exec.appendOutput([new NotebookCellOutput([x])], cell);
         });
         tidy.stdout.on("data", (tidyData: Uint8Array) => {
             console.log("data", tidyData);
-            const x = new NotebookCellOutputItem(tidyData, "jackos.mdl/chatgpt");
+            const x = new NotebookCellOutputItem(tidyData, "text/plain");
             exec.appendOutput([new NotebookCellOutput([x])], cell);
         });
         tidy.on("close", async (_) => {
             exec.clearOutput(cell);
             let finished = encoder.encode("Go has finished tidying modules, rerun cells now...");
-            const x = new NotebookCellOutputItem(finished, "jackos.mdl/chatgpt");
+            const x = new NotebookCellOutputItem(finished, "text/plain");
             exec.appendOutput([new NotebookCellOutput([x])], cell);
             exec.end(false, (new Date).getTime());
             resolve(0);
